@@ -10,10 +10,51 @@ A Python CLI tool that cleans junk files from Node.js, React Native, and Expo de
 - **Safe deletion** — Type "yes" to confirm, with full summary of what will be removed
 - **Zero dependencies** — Pure Python standard library, no `pip install` needed
 
+## Installation
+
+The recommended way is [pipx](https://pipx.pypa.io), which installs the `nodecleaner`
+command into an isolated environment and puts it on your `PATH`:
+
+```bash
+# Install pipx once (if you don't have it)
+brew install pipx && pipx ensurepath
+
+# Install NodeCleaner straight from GitHub
+pipx install git+https://github.com/rebazomar121/nodecleaner.git
+```
+
+Then run it from anywhere:
+
+```bash
+nodecleaner
+```
+
+To upgrade or remove later:
+
+```bash
+pipx upgrade nodecleaner
+pipx uninstall nodecleaner
+```
+
+> Prefer `pip`? `pip install git+https://github.com/rebazomar121/nodecleaner.git`
+> works too, but `pipx` keeps it isolated from your other projects.
+
+### Run without installing
+
+```bash
+git clone https://github.com/rebazomar121/nodecleaner.git
+cd nodecleaner
+python3 -m nodecleaner          # from the repo root
+```
+
 ## Usage
 
 ```bash
-python3 nodecleaner.py
+nodecleaner                # interactive menu
+nodecleaner --dry-run      # scan & select, but delete nothing (safe preview)
+nodecleaner --yes          # skip the final "type yes" confirmation
+nodecleaner --version
+nodecleaner --help
 ```
 
 ### Menu Options
@@ -59,6 +100,14 @@ python3 nodecleaner.py
 
 ## Requirements
 
-- macOS
-- Python 3.7+
+- macOS (Linux works for the non-Apple paths)
+- Python 3.8+
 - No external packages
+
+## Development
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -e . pytest
+pytest
+```

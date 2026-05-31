@@ -22,6 +22,10 @@ from typing import List, Optional, Tuple
 
 VERSION = "1.0.0"
 
+# Runtime flags, set from CLI args in main().
+DRY_RUN = False
+ASSUME_YES = False
+
 
 class Category(enum.Enum):
     XCODE = "Xcode"
@@ -46,6 +50,20 @@ class Category(enum.Enum):
     NUXT = "Nuxt.js"
     DIST = "Build Output"
     TURBO = "Turborepo"
+    CYPRESS = "Cypress"
+    PLAYWRIGHT = "Playwright"
+    ELECTRON = "Electron"
+    NODE_GYP = "node-gyp"
+    NVM = "nvm"
+    DENO = "Deno"
+    PUPPETEER = "Puppeteer"
+    NX = "Nx"
+    ANGULAR = "Angular"
+    PARCEL = "Parcel"
+    GATSBY = "Gatsby"
+    SVELTEKIT = "SvelteKit"
+    JEST = "Jest"
+    FIREBASE = "Firebase"
 
 
 @dataclass
@@ -79,6 +97,33 @@ SYSTEM_TARGETS = [
     (os.path.join(HOME, ".expo"), "Expo CLI cache", Category.EXPO),
     (os.path.join(HOME, "Library/Caches/com.facebook.watchman"), "Watchman cache", Category.WATCHMAN),
     (os.path.join(HOME, ".cache/typescript"), "TypeScript cache", Category.TYPESCRIPT),
+    # Testing tool browser caches
+    (os.path.join(HOME, "Library/Caches/Cypress"), "Cypress binaries", Category.CYPRESS),
+    (os.path.join(HOME, "Library/Caches/ms-playwright"), "Playwright browsers", Category.PLAYWRIGHT),
+    (os.path.join(HOME, ".cache/puppeteer"), "Puppeteer browsers", Category.PUPPETEER),
+    # Electron & native addon caches
+    (os.path.join(HOME, "Library/Caches/electron"), "Electron binaries", Category.ELECTRON),
+    (os.path.join(HOME, "Library/Caches/node-gyp"), "node-gyp headers", Category.NODE_GYP),
+    (os.path.join(HOME, ".node-gyp"), "node-gyp headers (legacy)", Category.NODE_GYP),
+    # Additional package manager caches
+    (os.path.join(HOME, "Library/Caches/pnpm"), "pnpm metadata cache", Category.PNPM),
+    (os.path.join(HOME, "Library/Caches/bun"), "Bun metadata cache", Category.BUN),
+    # Node version manager caches
+    (os.path.join(HOME, ".nvm/.cache"), "nvm download cache", Category.NVM),
+    (os.path.join(HOME, "Library/Application Support/fnm"), "fnm Node versions", Category.NVM),
+    (os.path.join(HOME, ".volta/cache"), "Volta download cache", Category.NVM),
+    # Framework & tool caches
+    (os.path.join(HOME, "Library/Caches/next-swc"), "Next.js SWC compiler", Category.NEXT),
+    (os.path.join(HOME, "Library/Caches/eas-cli"), "EAS CLI cache", Category.EXPO),
+    (os.path.join(HOME, "Library/Caches/deno"), "Deno cache", Category.DENO),
+    (os.path.join(HOME, ".firebase"), "Firebase CLI cache", Category.FIREBASE),
+    # Additional CocoaPods & Gradle paths
+    (os.path.join(HOME, ".cocoapods/repos"), "CocoaPods spec repos", Category.COCOAPODS),
+    (os.path.join(HOME, ".gradle/wrapper/dists"), "Gradle wrapper dists", Category.GRADLE),
+    (os.path.join(HOME, ".gradle/daemon"), "Gradle daemon logs", Category.GRADLE),
+    # Misc Node.js caches
+    (os.path.join(HOME, "Library/Caches/checkpoint-nodejs"), "Node.js update checks", Category.NPM),
+    (os.path.join(HOME, ".cache/prisma"), "Prisma query engines", Category.NPM),
 ]
 
 TMPDIR_PATTERNS = [
@@ -86,6 +131,9 @@ TMPDIR_PATTERNS = [
     ("metro-bundler-cache-*", "Metro bundler cache", Category.METRO),
     ("metro-cache", "Metro cache", Category.METRO),
     ("haste-map-*", "Haste map cache", Category.REACT_NATIVE),
+    ("v8-compile-cache-*", "V8 compile cache", Category.NPM),
+    ("node-compile-cache*", "Node.js compile cache", Category.NPM),
+    ("jest_*", "Jest test cache", Category.JEST),
 ]
 
 PROJECT_SCAN_DIRS = [
@@ -99,6 +147,15 @@ PROJECT_SCAN_DIRS = [
     (".nuxt", "Nuxt.js build", Category.NUXT),
     ("dist", "Build output", Category.DIST),
     (".turbo", "Turborepo cache", Category.TURBO),
+    (".angular", "Angular CLI cache", Category.ANGULAR),
+    (".parcel-cache", "Parcel bundler cache", Category.PARCEL),
+    (".cache", "Build cache (Gatsby/Remix)", Category.GATSBY),
+    (".svelte-kit", "SvelteKit build", Category.SVELTEKIT),
+    (".nx", "Nx cache", Category.NX),
+    ("coverage", "Test coverage reports", Category.JEST),
+    ("build", "Build output", Category.DIST),
+    ("out", "Build output", Category.DIST),
+    ("storybook-static", "Storybook build", Category.DIST),
 ]
 
 # Directories to skip when walking the project tree
@@ -266,7 +323,8 @@ def scan_projects(base_dir: str) -> List[CleanupTarget]:
         dirnames[:] = [
             d for d in dirnames
             if d not in PRUNE_DIRS and not d.startswith(".")
-            or d in (".expo", ".next", ".nuxt", ".turbo")
+            or d in (".expo", ".next", ".nuxt", ".turbo", ".angular",
+                     ".parcel-cache", ".cache", ".svelte-kit", ".nx")
         ]
 
         # Check each possible target
@@ -468,6 +526,11 @@ def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
         sys.stdout.flush()
 
         try:
+            if DRY_RUN:
+                # Simulate: report what would be freed without touching disk.
+                success += 1
+                freed += target.size
+                continue
             shutil.rmtree(target.path, onerror=_rmtree_onerror)
             if not os.path.exists(target.path):
                 success += 1
@@ -492,12 +555,17 @@ def print_summary(success: int, failed: int, freed: int):
     """Print deletion summary."""
     print()
     print(f"  {Colors.BOLD}{'═' * 44}{Colors.RESET}")
-    print(f"  {Colors.GREEN}{Colors.BOLD}Cleanup Complete!{Colors.RESET}")
+    if DRY_RUN:
+        print(f"  {Colors.BLUE}{Colors.BOLD}Dry Run Complete!{Colors.RESET}")
+    else:
+        print(f"  {Colors.GREEN}{Colors.BOLD}Cleanup Complete!{Colors.RESET}")
     print(f"  {Colors.BOLD}{'═' * 44}{Colors.RESET}")
-    print(f"  {Colors.GREEN}✓ Deleted:{Colors.RESET}  {success} items")
+    verb = "Would delete" if DRY_RUN else "Deleted"
+    print(f"  {Colors.GREEN}✓ {verb}:{Colors.RESET}  {success} items")
     if failed > 0:
         print(f"  {Colors.RED}✗ Failed:{Colors.RESET}   {failed} items")
-    print(f"  {Colors.CYAN}♻ Freed:{Colors.RESET}    {Colors.BOLD}{format_size(freed)}{Colors.RESET}")
+    freed_label = "Would free" if DRY_RUN else "Freed"
+    print(f"  {Colors.CYAN}♻ {freed_label}:{Colors.RESET}    {Colors.BOLD}{format_size(freed)}{Colors.RESET}")
     print(f"  {Colors.BOLD}{'═' * 44}{Colors.RESET}")
     print()
 
@@ -617,9 +685,14 @@ class NodeCleaner:
         total_size = sum(t.size for t in selected)
 
         print()
-        print(f"  {Colors.BG_RED}{Colors.WHITE}{Colors.BOLD} WARNING {Colors.RESET}")
-        print(f"  You are about to delete {Colors.BOLD}{len(selected)}{Colors.RESET} items "
-              f"({Colors.YELLOW}{format_size(total_size)}{Colors.RESET})")
+        if DRY_RUN:
+            print(f"  {Colors.BG_BLUE}{Colors.WHITE}{Colors.BOLD} DRY RUN {Colors.RESET}")
+            print(f"  Would delete {Colors.BOLD}{len(selected)}{Colors.RESET} items "
+                  f"({Colors.YELLOW}{format_size(total_size)}{Colors.RESET}) — nothing will be removed")
+        else:
+            print(f"  {Colors.BG_RED}{Colors.WHITE}{Colors.BOLD} WARNING {Colors.RESET}")
+            print(f"  You are about to delete {Colors.BOLD}{len(selected)}{Colors.RESET} items "
+                  f"({Colors.YELLOW}{format_size(total_size)}{Colors.RESET})")
         print()
 
         # Show what will be deleted
@@ -630,12 +703,16 @@ class NodeCleaner:
             print(f"    {Colors.DIM}... and {len(selected) - 10} more{Colors.RESET}")
 
         print()
-        print(f"  {Colors.RED}{Colors.BOLD}This action cannot be undone!{Colors.RESET}")
+        if not DRY_RUN:
+            print(f"  {Colors.RED}{Colors.BOLD}This action cannot be undone!{Colors.RESET}")
 
-        try:
-            confirm = input(f"  Type {Colors.RED}{Colors.BOLD}yes{Colors.RESET} to confirm: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            confirm = ""
+        if ASSUME_YES or DRY_RUN:
+            confirm = "yes"
+        else:
+            try:
+                confirm = input(f"  Type {Colors.RED}{Colors.BOLD}yes{Colors.RESET} to confirm: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                confirm = ""
 
         if confirm.lower() != "yes":
             print(f"\n  {Colors.YELLOW}Cancelled.{Colors.RESET}")
@@ -723,6 +800,12 @@ class NodeCleaner:
         print(f"    • node_modules directories")
         print(f"    • Build outputs (ios/build, android/build, dist)")
         print(f"    • Framework caches (.next, .nuxt, .expo, .turbo)")
+        print(f"    • Angular, Parcel, SvelteKit, Gatsby, Nx caches")
+        print(f"    • Cypress, Playwright, Puppeteer browser caches")
+        print(f"    • Electron & node-gyp build caches")
+        print(f"    • nvm, fnm, Volta version manager caches")
+        print(f"    • Deno, Firebase CLI, Prisma caches")
+        print(f"    • Jest, Storybook, coverage outputs")
         print()
         print(f"  {Colors.DIM}Pure Python — no external dependencies{Colors.RESET}")
         print()
@@ -733,7 +816,33 @@ class NodeCleaner:
         sys.exit(0)
 
 
-def main():
+def main(argv: Optional[List[str]] = None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="nodecleaner",
+        description="Clean junk files from Node.js / React Native / Expo development on macOS.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"NodeCleaner {VERSION}"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan and select normally, but do not delete anything (report what would be freed).",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip the final 'type yes to confirm' prompt before deleting.",
+    )
+    args = parser.parse_args(argv)
+
+    global DRY_RUN, ASSUME_YES
+    DRY_RUN = args.dry_run
+    ASSUME_YES = args.yes
+
     if sys.platform != "darwin":
         print("Warning: NodeCleaner is designed for macOS. Some paths may not exist on your system.")
 
