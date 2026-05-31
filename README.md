@@ -1,3 +1,6 @@
+<img width="1080" height="1080" alt="nodecleaner-hero (1)" src="https://github.com/user-attachments/assets/d7bc623e-9b7b-4a3a-a39e-3ffe3e4ffc3a" />
+
+
 # NodeCleaner
 
 A Python CLI tool that cleans junk files from Node.js, React Native, and Expo development on macOS.
