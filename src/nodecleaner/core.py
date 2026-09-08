@@ -2,7 +2,9 @@
 """NodeCleaner - Clean junk files from Node.js/React Native/Expo development on macOS."""
 
 import enum
+import fnmatch
 import glob
+import json
 import os
 import shutil
 import signal
@@ -20,7 +22,7 @@ from typing import List, Optional, Tuple
 # 1. Constants & Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Runtime flags, set from CLI args in main().
 DRY_RUN = False
@@ -65,6 +67,15 @@ class Category(enum.Enum):
     JEST = "Jest"
     FIREBASE = "Firebase"
     APP_BUILD = "App Build"
+    ANDROID_STUDIO = "Android Studio"
+    ANDROID_EMULATOR = "Android Emulator"
+    KOTLIN = "Kotlin"
+    DETOX = "Detox"
+    IDE = "IDE Cache"
+    RUBY = "Ruby Gems"
+    VITE = "Vite"
+    ESLINT = "ESLint"
+    LOGS = "Logs"
 
 
 @dataclass
@@ -74,6 +85,9 @@ class CleanupTarget:
     category: Category
     size: int = 0
     selected: bool = False
+    # When set, this command is run instead of deleting `path` directly
+    # (used for things like `xcrun simctl delete <udid>`).
+    command: Optional[List[str]] = None
 
 
 HOME = os.path.expanduser("~")
@@ -125,6 +139,39 @@ SYSTEM_TARGETS = [
     # Misc Node.js caches
     (os.path.join(HOME, "Library/Caches/checkpoint-nodejs"), "Node.js update checks", Category.NPM),
     (os.path.join(HOME, ".cache/prisma"), "Prisma query engines", Category.NPM),
+    # Xcode device support & user caches — Xcode re-downloads / regenerates these
+    (os.path.join(HOME, "Library/Developer/Xcode/iOS DeviceSupport"), "iOS device support symbols", Category.XCODE),
+    (os.path.join(HOME, "Library/Developer/Xcode/watchOS DeviceSupport"), "watchOS device support symbols", Category.XCODE),
+    (os.path.join(HOME, "Library/Developer/Xcode/tvOS DeviceSupport"), "tvOS device support symbols", Category.XCODE),
+    (os.path.join(HOME, "Library/Developer/Xcode/UserData/Previews"), "SwiftUI preview caches", Category.XCODE),
+    (os.path.join(HOME, "Library/Developer/Xcode/UserData/IB Support"), "Interface Builder caches", Category.XCODE),
+    (os.path.join(HOME, "Library/Developer/Xcode/DocumentationCache"), "Xcode documentation cache", Category.XCODE),
+    (os.path.join(HOME, "Library/Developer/Xcode/iOS Device Logs"), "iOS device logs", Category.XCODE),
+    (os.path.join(HOME, "Library/Logs/CoreSimulator"), "iOS simulator logs", Category.SIMULATOR),
+    # Android / Kotlin tooling caches
+    (os.path.join(HOME, ".android/cache"), "Android SDK cache", Category.ANDROID_STUDIO),
+    (os.path.join(HOME, ".android/build-cache"), "Android build cache (legacy)", Category.ANDROID_STUDIO),
+    (os.path.join(HOME, ".konan"), "Kotlin/Native toolchains", Category.KOTLIN),
+    # React Native tooling caches
+    (os.path.join(HOME, ".flipper"), "Flipper cache", Category.REACT_NATIVE),
+    (os.path.join(HOME, ".rncache"), "RN third-party cache (legacy)", Category.REACT_NATIVE),
+    (os.path.join(HOME, "Library/Detox"), "Detox framework cache", Category.DETOX),
+]
+
+# Editor caches (indexes / GPU / extension downloads) — rebuilt automatically on next launch.
+_EDITOR_CACHE_SUBDIRS = ("Cache", "CachedData", "CachedExtensionVSIXs", "Code Cache", "GPUCache")
+SYSTEM_TARGETS += [
+    (os.path.join(HOME, "Library/Application Support", app_dir, sub), f"{app_name} cache ({sub})", Category.IDE)
+    for app_dir, app_name in (("Code", "VS Code"), ("Cursor", "Cursor"))
+    for sub in _EDITOR_CACHE_SUBDIRS
+]
+
+# Glob patterns relative to HOME (for versioned / per-device directories).
+HOME_PATTERNS = [
+    ("Library/Caches/Google/AndroidStudio*", "Android Studio caches", Category.ANDROID_STUDIO),
+    ("Library/Logs/Google/AndroidStudio*", "Android Studio logs", Category.ANDROID_STUDIO),
+    ("Library/Caches/JetBrains/*", "JetBrains IDE caches", Category.IDE),
+    (".android/avd/*.avd/snapshots", "Emulator quick-boot snapshots", Category.ANDROID_EMULATOR),
 ]
 
 TMPDIR_PATTERNS = [
@@ -135,6 +182,7 @@ TMPDIR_PATTERNS = [
     ("v8-compile-cache-*", "V8 compile cache", Category.NPM),
     ("node-compile-cache*", "Node.js compile cache", Category.NPM),
     ("jest_*", "Jest test cache", Category.JEST),
+    ("eas-build-local-*", "EAS local build temp", Category.EXPO),
 ]
 
 PROJECT_SCAN_DIRS = [
@@ -157,6 +205,38 @@ PROJECT_SCAN_DIRS = [
     ("build", "Build output", Category.DIST),
     ("out", "Build output", Category.DIST),
     ("storybook-static", "Storybook build", Category.DIST),
+    # Android native intermediates & project-local Gradle cache
+    (os.path.join("android", ".gradle"), "Android project Gradle cache", Category.ANDROID_BUILD),
+    (os.path.join("android", ".cxx"), "Android NDK intermediates", Category.ANDROID_BUILD),
+    (os.path.join("android", "app", ".cxx"), "Android NDK intermediates", Category.ANDROID_BUILD),
+    # Ruby gems installed by bundler for iOS tooling
+    (os.path.join("vendor", "bundle"), "Ruby gems (bundler)", Category.RUBY),
+    # Test artifacts (videos, traces, reports)
+    ("playwright-report", "Playwright HTML report", Category.PLAYWRIGHT),
+    ("test-results", "Playwright test results", Category.PLAYWRIGHT),
+    (os.path.join("cypress", "videos"), "Cypress videos", Category.CYPRESS),
+    (os.path.join("cypress", "screenshots"), "Cypress screenshots", Category.CYPRESS),
+    (".jest-cache", "Jest cache", Category.JEST),
+    (".nyc_output", "NYC coverage output", Category.JEST),
+    # More framework build outputs / caches
+    (".output", "Nuxt 3 build output", Category.NUXT),
+    ("web-build", "Expo web build", Category.EXPO),
+    (".vite", "Vite cache", Category.VITE),
+    (".docusaurus", "Docusaurus build cache", Category.DIST),
+    (".astro", "Astro build cache", Category.DIST),
+    (".rollup.cache", "Rollup cache", Category.DIST),
+]
+
+# Junk *files* (matched with fnmatch against the file name) found while scanning projects.
+PROJECT_SCAN_FILES = [
+    (".eslintcache", "ESLint cache", Category.ESLINT),
+    ("*.tsbuildinfo", "TypeScript build info", Category.TYPESCRIPT),
+    ("*.hprof", "Java heap dump", Category.ANDROID_BUILD),
+    ("npm-debug.log*", "npm debug log", Category.LOGS),
+    ("yarn-error.log", "Yarn error log", Category.LOGS),
+    ("yarn-debug.log*", "Yarn debug log", Category.LOGS),
+    ("pnpm-debug.log*", "pnpm debug log", Category.LOGS),
+    ("lerna-debug.log*", "Lerna debug log", Category.LOGS),
 ]
 
 # Directories to skip when walking the project tree
@@ -289,34 +369,84 @@ def _get_dir_size(path: str) -> int:
     return total
 
 
+def _add_dir_target(targets, seen, path, desc, cat) -> None:
+    """Append a directory target if it exists, is not a symlink, is non-empty and unseen."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return
+    real = os.path.realpath(path)
+    if real in seen:
+        return
+    seen.add(real)
+    size = _get_dir_size(path)
+    if size > 0:
+        targets.append(CleanupTarget(path=path, description=desc, category=cat, size=size))
+
+
+def _runtime_label(runtime_id: str) -> str:
+    """'com.apple.CoreSimulator.SimRuntime.iOS-16-4' -> 'iOS 16.4'."""
+    tail = runtime_id.rsplit(".", 1)[-1]
+    parts = tail.split("-")
+    if len(parts) > 1:
+        return f"{parts[0]} {'.'.join(parts[1:])}"
+    return tail
+
+
+def scan_unavailable_simulators() -> List[CleanupTarget]:
+    """Find simulators whose runtime is no longer installed.
+
+    These cannot be booted any more, so they are pure junk. They are removed
+    with `xcrun simctl delete <udid>` rather than a raw directory delete so
+    CoreSimulator's device registry stays consistent.
+    """
+    targets = []
+    try:
+        result = subprocess.run(
+            ["xcrun", "simctl", "list", "devices", "-j"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return targets
+        data = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return targets
+
+    for runtime_id, devices in data.get("devices", {}).items():
+        for dev in devices:
+            if dev.get("isAvailable", True):
+                continue
+            udid = dev.get("udid")
+            if not udid:
+                continue
+            data_path = dev.get("dataPath") or ""
+            size = _get_dir_size(data_path) if os.path.isdir(data_path) else 0
+            name = dev.get("name", "Unknown device")
+            targets.append(CleanupTarget(
+                path=data_path or udid,
+                description=f"Unavailable simulator: {name} ({_runtime_label(runtime_id)})",
+                category=Category.SIMULATOR,
+                size=size,
+                command=["xcrun", "simctl", "delete", udid],
+            ))
+    return targets
+
+
 def scan_system_caches() -> List[CleanupTarget]:
-    """Scan fixed system cache paths."""
+    """Scan fixed system cache paths, HOME/tmp glob patterns and unavailable simulators."""
     targets = []
     seen = set()
 
     # Fixed paths
     for path, desc, cat in SYSTEM_TARGETS:
-        real = os.path.realpath(path)
-        if real in seen:
-            continue
-        if os.path.isdir(path):
-            seen.add(real)
-            size = _get_dir_size(path)
-            if size > 0:
-                targets.append(CleanupTarget(path=path, description=desc, category=cat, size=size))
+        _add_dir_target(targets, seen, path, desc, cat)
 
-    # Tmpdir glob patterns
-    for pattern, desc, cat in TMPDIR_PATTERNS:
-        full_pattern = os.path.join(TMPDIR, pattern)
-        for match in glob.glob(full_pattern):
-            real = os.path.realpath(match)
-            if real in seen:
-                continue
-            if os.path.isdir(match):
-                seen.add(real)
-                size = _get_dir_size(match)
-                if size > 0:
-                    targets.append(CleanupTarget(path=match, description=desc, category=cat, size=size))
+    # Glob patterns under HOME and the temp dir
+    for base, patterns in ((HOME, HOME_PATTERNS), (TMPDIR, TMPDIR_PATTERNS)):
+        for pattern, desc, cat in patterns:
+            for match in glob.glob(os.path.join(base, pattern)):
+                _add_dir_target(targets, seen, match, desc, cat)
+
+    # Simulators that can no longer be booted (runtime removed)
+    targets.extend(scan_unavailable_simulators())
 
     targets.sort(key=lambda t: t.size, reverse=True)
     return targets
@@ -331,7 +461,13 @@ def scan_projects(base_dir: str) -> List[CleanupTarget]:
     if not os.path.isdir(base_dir):
         return targets
 
+    found_dirs = set()  # directories already reported as targets; never walk inside them
+
     for dirpath, dirnames, filenames in os.walk(base_dir, followlinks=False):
+        if dirpath in found_dirs:
+            dirnames[:] = []
+            continue
+
         # Prune directories we don't want to walk into
         dirnames[:] = [
             d for d in dirnames
@@ -340,19 +476,41 @@ def scan_projects(base_dir: str) -> List[CleanupTarget]:
                      ".parcel-cache", ".cache", ".svelte-kit", ".nx")
         ]
 
-        # Check each possible target
+        # Check each possible target directory
         for dirname, desc, cat in PROJECT_SCAN_DIRS:
             candidate = os.path.join(dirpath, dirname)
-            if os.path.isdir(candidate):
-                real = os.path.realpath(candidate)
-                if real in seen:
+            if os.path.islink(candidate) or not os.path.isdir(candidate):
+                continue
+            real = os.path.realpath(candidate)
+            if real in seen:
+                continue
+            seen.add(real)
+            found_dirs.add(candidate)
+            size = _get_dir_size(candidate)
+            if size > 0:
+                targets.append(CleanupTarget(
+                    path=candidate, description=desc, category=cat, size=size
+                ))
+
+        # Check for junk files in this directory
+        for name in filenames:
+            for pattern, desc, cat in PROJECT_SCAN_FILES:
+                if not fnmatch.fnmatch(name, pattern):
                     continue
-                seen.add(real)
-                size = _get_dir_size(candidate)
-                if size > 0:
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.path.islink(full) or not os.path.isfile(full):
+                        break
+                    size = os.path.getsize(full)
+                except OSError:
+                    break
+                real = os.path.realpath(full)
+                if real not in seen and size > 0:
+                    seen.add(real)
                     targets.append(CleanupTarget(
-                        path=candidate, description=desc, category=cat, size=size
+                        path=full, description=desc, category=cat, size=size
                     ))
+                break
 
         # Further prune: if we found node_modules here, don't go into it
         if "node_modules" in dirnames:
@@ -492,8 +650,8 @@ class InteractiveSelector:
             size_str = format_size(t.size)
             cat_str = f"{Colors.DIM}[{t.category.value}]{Colors.RESET}"
 
-            # Shorten path for display
-            display_path = t.path.replace(HOME, "~")
+            # Shorten path for display (command targets show their description instead)
+            display_path = t.description if t.command else t.path.replace(HOME, "~")
             if len(display_path) > 50:
                 display_path = "..." + display_path[-47:]
 
@@ -582,7 +740,7 @@ def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
 
     print()
     for i, target in enumerate(targets):
-        label = target.path.replace(HOME, "~")
+        label = target.description if target.command else target.path.replace(HOME, "~")
         if len(label) > 40:
             label = "..." + label[-37:]
         sys.stdout.write(progress_bar(i, total, label=label))
@@ -593,6 +751,17 @@ def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
                 # Simulate: report what would be freed without touching disk.
                 success += 1
                 freed += target.size
+                continue
+            if target.command:
+                # Tool-managed target (e.g. `xcrun simctl delete <udid>`).
+                result = subprocess.run(
+                    target.command, capture_output=True, text=True, timeout=300, check=False
+                )
+                if result.returncode == 0:
+                    success += 1
+                    freed += target.size
+                else:
+                    failed += 1
                 continue
             if os.path.islink(target.path) or os.path.isfile(target.path):
                 # Single file target (e.g. .apk / .ipa / .aab) — os.remove raises on failure.
@@ -769,7 +938,7 @@ class NodeCleaner:
 
         # Show what will be deleted
         for t in selected[:10]:
-            display_path = t.path.replace(HOME, "~")
+            display_path = t.description if t.command else t.path.replace(HOME, "~")
             print(f"    {Colors.RED}•{Colors.RESET} {display_path}")
         if len(selected) > 10:
             print(f"    {Colors.DIM}... and {len(selected) - 10} more{Colors.RESET}")
@@ -918,7 +1087,18 @@ class NodeCleaner:
         print(f"    • nvm, fnm, Volta version manager caches")
         print(f"    • Deno, Firebase CLI, Prisma caches")
         print(f"    • Jest, Storybook, coverage outputs")
+        print(f"    • Xcode device support symbols, previews & logs")
+        print(f"    • Unavailable iOS simulators (runtime removed)")
+        print(f"    • Android Studio caches, emulator snapshots, NDK .cxx")
+        print(f"    • Kotlin/Native, Flipper, Detox tool caches")
+        print(f"    • VS Code, Cursor, JetBrains editor caches")
+        print(f"    • Playwright / Cypress reports, videos, screenshots")
+        print(f"    • Stray logs, .eslintcache, *.tsbuildinfo, *.hprof")
         print(f"    • .apk / .ipa / .aab app builds in Downloads, Documents, Desktop")
+        print()
+        print(f"  {Colors.BOLD}Never touched:{Colors.RESET} source code, emulator images,")
+        print(f"  Android SDK, ~/.m2, Xcode user schemes/breakpoints, .vercel/.netlify")
+        print(f"  project links, or anything that cannot be regenerated by a rebuild.")
         print()
         print(f"  {Colors.DIM}Pure Python — no external dependencies{Colors.RESET}")
         print()
