@@ -9,6 +9,7 @@ A Python CLI tool that cleans junk files from Node.js, React Native, and Expo de
 
 - **System cache cleaning** — Xcode, npm, Yarn, pnpm, Bun, Gradle, CocoaPods, Metro, and more
 - **Project scanning** — Finds `node_modules`, build outputs, and framework caches across your projects
+- **App build finder** — Locates stray `.apk`, `.ipa`, and `.aab` files in Downloads, Documents, and Desktop so you can delete them in one go
 - **Interactive selector** — Arrow keys to navigate, space to toggle, 'a' to select all
 - **Safe deletion** — Type "yes" to confirm, with full summary of what will be removed
 - **Zero dependencies** — Pure Python standard library, no `pip install` needed
@@ -67,8 +68,9 @@ nodecleaner --help
 | **[1] Full Clean** | Scan both system caches and a projects directory |
 | **[2] System Caches** | Scan only system-wide caches (Xcode, npm, Gradle, etc.) |
 | **[3] Project Files** | Scan a directory for node_modules, build outputs, etc. |
-| **[4] About** | Show information about the tool |
-| **[5] Exit** | Quit |
+| **[4] App Builds** | Find `.apk` / `.ipa` / `.aab` files in Downloads, Documents, Desktop (plus an optional extra folder) |
+| **[5] About** | Show information about the tool |
+| **[6] Exit** | Quit |
 
 ### Interactive Selector Controls
 
@@ -100,6 +102,15 @@ nodecleaner --help
 - `ios/build`, `android/build`, `android/app/build` — Native build outputs
 - `.expo`, `.next`, `.nuxt`, `.turbo` — Framework caches
 - `dist` — Build output
+
+### App Builds
+
+- `.apk` — Android APK
+- `.aab` — Android App Bundle
+- `.ipa` — iOS IPA
+
+Searched in `~/Downloads`, `~/Documents`, and `~/Desktop` by default. You can add one
+extra folder when prompted. Hidden folders, `node_modules`, and symlinks are skipped.
 
 ## Requirements
 

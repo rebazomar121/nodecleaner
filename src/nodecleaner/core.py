@@ -64,6 +64,7 @@ class Category(enum.Enum):
     SVELTEKIT = "SvelteKit"
     JEST = "Jest"
     FIREBASE = "Firebase"
+    APP_BUILD = "App Build"
 
 
 @dataclass
@@ -160,6 +161,18 @@ PROJECT_SCAN_DIRS = [
 
 # Directories to skip when walking the project tree
 PRUNE_DIRS = {"node_modules", ".git", ".hg", ".svn", "__pycache__", ".Trash"}
+
+# Mobile app build artifacts (.apk / .aab / .ipa) that pile up in user folders.
+APP_BUILD_EXTENSIONS = {
+    ".apk": "Android APK",
+    ".aab": "Android App Bundle",
+    ".ipa": "iOS IPA",
+}
+APP_BUILD_SCAN_DIRS = [
+    os.path.join(HOME, "Downloads"),
+    os.path.join(HOME, "Documents"),
+    os.path.join(HOME, "Desktop"),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,6 +362,56 @@ def scan_projects(base_dir: str) -> List[CleanupTarget]:
     return targets
 
 
+def scan_app_builds(base_dirs: Optional[List[str]] = None) -> List[CleanupTarget]:
+    """Find .apk / .aab / .ipa files under the given folders.
+
+    Defaults to ~/Downloads, ~/Documents and ~/Desktop. Symlinks are never
+    followed and hidden / VCS / node_modules directories are skipped.
+    """
+    targets = []
+    seen = set()
+    dirs = APP_BUILD_SCAN_DIRS if base_dirs is None else base_dirs
+
+    for base in dirs:
+        base = os.path.expanduser(base)
+        if not os.path.isdir(base):
+            continue
+
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in PRUNE_DIRS and not d.startswith(".")
+            ]
+
+            for name in filenames:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in APP_BUILD_EXTENSIONS:
+                    continue
+
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.path.islink(full) or not os.path.isfile(full):
+                        continue
+                    size = os.path.getsize(full)
+                except OSError:
+                    continue
+
+                real = os.path.realpath(full)
+                if real in seen:
+                    continue
+                seen.add(real)
+
+                targets.append(CleanupTarget(
+                    path=full,
+                    description=APP_BUILD_EXTENSIONS[ext],
+                    category=Category.APP_BUILD,
+                    size=size,
+                ))
+
+    targets.sort(key=lambda t: t.size, reverse=True)
+    return targets
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Interactive Selector
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,6 +594,12 @@ def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
                 success += 1
                 freed += target.size
                 continue
+            if os.path.islink(target.path) or os.path.isfile(target.path):
+                # Single file target (e.g. .apk / .ipa / .aab) — os.remove raises on failure.
+                os.remove(target.path)
+                success += 1
+                freed += target.size
+                continue
             shutil.rmtree(target.path, onerror=_rmtree_onerror)
             if not os.path.exists(target.path):
                 success += 1
@@ -605,8 +674,10 @@ class NodeCleaner:
             elif choice == "3":
                 self._run_project_clean()
             elif choice == "4":
-                self._show_about()
+                self._run_app_build_clean()
             elif choice == "5":
+                self._show_about()
+            elif choice == "6":
                 self._exit()
             else:
                 print(f"  {Colors.RED}Invalid choice. Please try again.{Colors.RESET}")
@@ -624,14 +695,15 @@ class NodeCleaner:
         print(f"  {Colors.CYAN}[1]{Colors.RESET} Full Clean (System + Projects)")
         print(f"  {Colors.CYAN}[2]{Colors.RESET} System Caches Only")
         print(f"  {Colors.CYAN}[3]{Colors.RESET} Project Files Only")
-        print(f"  {Colors.CYAN}[4]{Colors.RESET} About")
-        print(f"  {Colors.CYAN}[5]{Colors.RESET} Exit")
+        print(f"  {Colors.CYAN}[4]{Colors.RESET} App Builds (.apk / .ipa / .aab)")
+        print(f"  {Colors.CYAN}[5]{Colors.RESET} About")
+        print(f"  {Colors.CYAN}[6]{Colors.RESET} Exit")
         print()
 
         try:
-            choice = input(f"  {Colors.BOLD}Choose an option [1-5]:{Colors.RESET} ").strip()
+            choice = input(f"  {Colors.BOLD}Choose an option [1-6]:{Colors.RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
-            choice = "5"
+            choice = "6"
         print()
         return choice
 
@@ -752,6 +824,46 @@ class NodeCleaner:
         if selected:
             self._confirm_and_delete(selected)
 
+    def _run_app_build_clean(self):
+        """Find and remove .apk / .ipa / .aab files from Downloads, Documents, Desktop."""
+        dirs = [d for d in APP_BUILD_SCAN_DIRS if os.path.isdir(d)]
+
+        # Optional extra folder on top of the defaults.
+        try:
+            extra = input(
+                f"  {Colors.BOLD}Extra folder to scan{Colors.RESET} "
+                f"[{Colors.DIM}ENTER to skip{Colors.RESET}]: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if extra:
+            extra = os.path.expanduser(extra)
+            if not os.path.isdir(extra):
+                print(f"  {Colors.RED}Directory not found: {extra}{Colors.RESET}")
+                print()
+                return
+            if extra not in dirs:
+                dirs.append(extra)
+
+        if not dirs:
+            print(f"  {Colors.YELLOW}No folders to scan.{Colors.RESET}")
+            print()
+            return
+
+        labels = ", ".join(d.replace(HOME, "~") for d in dirs)
+        print()
+        print(f"  {Colors.BOLD}Scanning for app builds in {labels}...{Colors.RESET}")
+        spinner = Spinner("Scanning for .apk / .ipa / .aab files")
+        spinner.start()
+        targets = scan_app_builds(dirs)
+        spinner.stop(f"Found {len(targets)} app build files")
+
+        selected = self._scan_and_select(targets)
+        if selected:
+            self._confirm_and_delete(selected)
+
     def _run_full_clean(self):
         """Run both system and project cleanup."""
         projects_dir = self._prompt_projects_dir()
@@ -806,6 +918,7 @@ class NodeCleaner:
         print(f"    • nvm, fnm, Volta version manager caches")
         print(f"    • Deno, Firebase CLI, Prisma caches")
         print(f"    • Jest, Storybook, coverage outputs")
+        print(f"    • .apk / .ipa / .aab app builds in Downloads, Documents, Desktop")
         print()
         print(f"  {Colors.DIM}Pure Python — no external dependencies{Colors.RESET}")
         print()
