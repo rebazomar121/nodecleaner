@@ -6,6 +6,7 @@ import fnmatch
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -16,13 +17,14 @@ import threading
 import time
 import tty
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Constants & Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Runtime flags, set from CLI args in main().
 DRY_RUN = False
@@ -76,6 +78,8 @@ class Category(enum.Enum):
     VITE = "Vite"
     ESLINT = "ESLint"
     LOGS = "Logs"
+    DOCKER_IMAGE = "Docker Image"
+    DOCKER_VOLUME = "Docker Volume"
 
 
 @dataclass
@@ -88,6 +92,9 @@ class CleanupTarget:
     # When set, this command is run instead of deleting `path` directly
     # (used for things like `xcrun simctl delete <udid>`).
     command: Optional[List[str]] = None
+    # Epoch seconds of when the item was created / last tagged. Only set for
+    # Docker targets, which are sorted oldest-first instead of largest-first.
+    timestamp: float = 0.0
 
 
 HOME = os.path.expanduser("~")
@@ -253,6 +260,10 @@ APP_BUILD_SCAN_DIRS = [
     os.path.join(HOME, "Documents"),
     os.path.join(HOME, "Desktop"),
 ]
+
+# Seconds to wait for a single `docker` CLI call. The CLI can hang for minutes
+# when Docker Desktop is stopped, so every call gets a hard timeout.
+DOCKER_TIMEOUT = 60
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,6 +581,215 @@ def scan_app_builds(base_dirs: Optional[List[str]] = None) -> List[CleanupTarget
     return targets
 
 
+# ── Docker ──────────────────────────────────────────────────────────────────
+
+def _docker_run(args: List[str], timeout: int = DOCKER_TIMEOUT) -> Optional[str]:
+    """Run `docker <args>` and return stdout, or None if it fails or times out."""
+    try:
+        result = subprocess.run(
+            ["docker"] + args, capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _docker_inspect(kind: str, ids: List[str]) -> List[dict]:
+    """`docker <kind> inspect` every id in one call; one dict per object."""
+    if not ids:
+        return []
+    out = _docker_run([kind, "inspect", "--format", "{{json .}}"] + ids)
+    if not out:
+        return []
+    objects = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            objects.append(json.loads(line))
+        except ValueError:
+            continue
+    return objects
+
+
+def _parse_docker_time(value: Optional[str]) -> float:
+    """RFC 3339 timestamp from `docker inspect` -> epoch seconds (0 if unset)."""
+    if not value or value.startswith("0001-01-01"):
+        return 0.0
+    ts = value.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    # Python < 3.11 needs exactly 3 or 6 fractional digits; Docker emits 9.
+    m = re.match(r"^(.*?)(\.\d+)?([+-]\d\d:\d\d)$", ts)
+    if m:
+        base, frac, tz = m.groups()
+        if frac:
+            frac = "." + frac[1:7].ljust(6, "0")
+        ts = f"{base}{frac or ''}{tz}"
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _parse_docker_size(value: Optional[str]) -> int:
+    """'1.23GB' / '512MB' / '12.5kB' (docker's decimal units) -> bytes."""
+    m = re.match(r"^\s*([\d.]+)\s*([kKMGTP]?)i?B?\s*$", value or "")
+    if not m:
+        return 0
+    number, unit = m.groups()
+    try:
+        num = float(number)
+    except ValueError:
+        return 0
+    power = {"": 0, "k": 1, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5}[unit]
+    return int(num * (1000 ** power))
+
+
+def _relative_age(timestamp: float, now: Optional[float] = None) -> str:
+    """Epoch seconds -> '3 days ago' / '2 months ago' ('unknown age' if unset)."""
+    if timestamp <= 0:
+        return "unknown age"
+    seconds = max((time.time() if now is None else now) - timestamp, 0)
+    units = (
+        ("year", 365 * 86400), ("month", 30 * 86400), ("week", 7 * 86400),
+        ("day", 86400), ("hour", 3600), ("minute", 60),
+    )
+    for name, span in units:
+        count = int(seconds // span)
+        if count >= 1:
+            return f"{count} {name}{'s' if count != 1 else ''} ago"
+    return "just now"
+
+
+def _shorten_middle(text: str, limit: int) -> str:
+    """Keep both ends of a long name ('registry.io/team/app:latest' style)."""
+    if len(text) <= limit:
+        return text
+    head = (limit - 1) // 2
+    return text[:head] + "…" + text[-(limit - 1 - head):]
+
+
+def _docker_volume_sizes() -> Dict[str, int]:
+    """Volume name -> size in bytes via `docker system df -v` ({} if unsupported)."""
+    out = _docker_run(["system", "df", "-v", "--format", "{{json .}}"], timeout=DOCKER_TIMEOUT * 2)
+    if not out:
+        return {}
+    # Newer CLIs print one JSON object; be tolerant of one object per line.
+    chunks = []
+    try:
+        chunks.append(json.loads(out))
+    except ValueError:
+        for line in out.splitlines():
+            try:
+                chunks.append(json.loads(line))
+            except ValueError:
+                continue
+
+    sizes: Dict[str, int] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        for vol in chunk.get("Volumes") or []:
+            name = vol.get("Name")
+            if name:
+                sizes[name] = _parse_docker_size(str(vol.get("Size", "")))
+    return sizes
+
+
+def docker_available() -> Tuple[bool, str]:
+    """Check that the docker CLI exists and the daemon answers -> (ok, message)."""
+    if not shutil.which("docker"):
+        return False, "Docker CLI not found — install Docker Desktop first."
+    out = _docker_run(["version", "--format", "{{.Server.Version}}"], timeout=15)
+    if not out or not out.strip():
+        return False, "Docker daemon is not responding — is Docker Desktop running?"
+    return True, out.strip()
+
+
+def scan_docker() -> Tuple[List[CleanupTarget], int]:
+    """List Docker images and volumes that no container references.
+
+    Returns (targets, skipped). `skipped` counts images / volumes still
+    referenced by a container (running or stopped): Docker refuses to remove
+    those without removing the container first, so they are left out — the
+    same rule Docker Desktop applies.
+
+    Docker does not record when an image or volume was last *used*, so the
+    list is sorted oldest-first by the closest signals it does keep: the time
+    an image was built / pulled / tagged and the time a volume was created.
+    """
+    targets: List[CleanupTarget] = []
+    skipped = 0
+
+    # Containers (running or stopped) pin the images and volumes they use.
+    container_ids = (_docker_run(["container", "ls", "-aq"]) or "").split()
+    used_images = set()
+    used_volumes = set()
+    for c in _docker_inspect("container", container_ids):
+        used_images.add(c.get("Image") or "")
+        for mount in c.get("Mounts") or []:
+            if mount.get("Type") == "volume" and mount.get("Name"):
+                used_volumes.add(mount["Name"])
+
+    # Images. `ls -q` repeats an ID once per tag, hence the dedup.
+    image_ids = (_docker_run(["image", "ls", "-q", "--no-trunc"]) or "").split()
+    for img in _docker_inspect("image", list(dict.fromkeys(image_ids))):
+        image_id = img.get("Id") or ""
+        if not image_id:
+            continue
+        if image_id in used_images:
+            skipped += 1
+            continue
+        tags = [t for t in img.get("RepoTags") or [] if t != "<none>:<none>"]
+        # LastTagTime is the local pull / build time; Created is the upstream
+        # build time and can be months older for pulled images.
+        tagged = _parse_docker_time((img.get("Metadata") or {}).get("LastTagTime"))
+        stamp = tagged or _parse_docker_time(img.get("Created"))
+        if tags:
+            label = _shorten_middle(tags[0], 30)
+            if len(tags) > 1:
+                label += f" +{len(tags) - 1}"
+        else:
+            label = f"<dangling> {image_id.split(':')[-1][:12]}"
+        targets.append(CleanupTarget(
+            path=image_id,
+            description=f"{label}  · {_relative_age(stamp)}",
+            category=Category.DOCKER_IMAGE,
+            size=int(img.get("Size") or 0),
+            # Removing by ID fails when an image has several tags; untag them all.
+            command=["docker", "image", "rm"] + (tags or [image_id]),
+            timestamp=stamp,
+        ))
+
+    # Volumes. Sizes only come from `docker system df -v`, which may be slow.
+    volume_names = (_docker_run(["volume", "ls", "-q"]) or "").split()
+    sizes = _docker_volume_sizes() if volume_names else {}
+    for vol in _docker_inspect("volume", volume_names):
+        name = vol.get("Name") or ""
+        if not name:
+            continue
+        if name in used_volumes:
+            skipped += 1
+            continue
+        created = _parse_docker_time(vol.get("CreatedAt"))
+        targets.append(CleanupTarget(
+            path=name,
+            description=f"volume {_shorten_middle(name, 26)}  · {_relative_age(created)}",
+            category=Category.DOCKER_VOLUME,
+            size=sizes.get(name, 0),
+            command=["docker", "volume", "rm", name],
+            timestamp=created,
+        ))
+
+    # Oldest first; items with no timestamp go last, ties broken by size.
+    targets.sort(key=lambda t: (t.timestamp <= 0, t.timestamp, -t.size))
+    return targets, skipped
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Interactive Selector
 # ─────────────────────────────────────────────────────────────────────────────
@@ -845,8 +1065,10 @@ class NodeCleaner:
             elif choice == "4":
                 self._run_app_build_clean()
             elif choice == "5":
-                self._show_about()
+                self._run_docker_clean()
             elif choice == "6":
+                self._show_about()
+            elif choice == "7":
                 self._exit()
             else:
                 print(f"  {Colors.RED}Invalid choice. Please try again.{Colors.RESET}")
@@ -865,14 +1087,15 @@ class NodeCleaner:
         print(f"  {Colors.CYAN}[2]{Colors.RESET} System Caches Only")
         print(f"  {Colors.CYAN}[3]{Colors.RESET} Project Files Only")
         print(f"  {Colors.CYAN}[4]{Colors.RESET} App Builds (.apk / .ipa / .aab)")
-        print(f"  {Colors.CYAN}[5]{Colors.RESET} About")
-        print(f"  {Colors.CYAN}[6]{Colors.RESET} Exit")
+        print(f"  {Colors.CYAN}[5]{Colors.RESET} Docker Images & Volumes")
+        print(f"  {Colors.CYAN}[6]{Colors.RESET} About")
+        print(f"  {Colors.CYAN}[7]{Colors.RESET} Exit")
         print()
 
         try:
-            choice = input(f"  {Colors.BOLD}Choose an option [1-6]:{Colors.RESET} ").strip()
+            choice = input(f"  {Colors.BOLD}Choose an option [1-7]:{Colors.RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
-            choice = "6"
+            choice = "7"
         print()
         return choice
 
@@ -1033,6 +1256,31 @@ class NodeCleaner:
         if selected:
             self._confirm_and_delete(selected)
 
+    def _run_docker_clean(self):
+        """List Docker images / volumes no container uses and remove the selected ones."""
+        ok, message = docker_available()
+        if not ok:
+            print(f"  {Colors.YELLOW}{message}{Colors.RESET}")
+            print()
+            return
+
+        print(f"  {Colors.BOLD}Scanning Docker images and volumes...{Colors.RESET}")
+        spinner = Spinner("Asking Docker for images, volumes and containers")
+        spinner.start()
+        targets, skipped = scan_docker()
+        spinner.stop(f"Found {len(targets)} unused images / volumes")
+
+        if skipped:
+            print(f"  {Colors.DIM}Skipped {skipped} in use by a container "
+                  f"(remove the container first to free them){Colors.RESET}")
+        print(f"  {Colors.DIM}Sorted oldest first. Docker does not track last use, so the age shown "
+              f"is when an image was pulled/built or a volume was created.{Colors.RESET}")
+        print()
+
+        selected = self._scan_and_select(targets)
+        if selected:
+            self._confirm_and_delete(selected)
+
     def _run_full_clean(self):
         """Run both system and project cleanup."""
         projects_dir = self._prompt_projects_dir()
@@ -1095,10 +1343,12 @@ class NodeCleaner:
         print(f"    • Playwright / Cypress reports, videos, screenshots")
         print(f"    • Stray logs, .eslintcache, *.tsbuildinfo, *.hprof")
         print(f"    • .apk / .ipa / .aab app builds in Downloads, Documents, Desktop")
+        print(f"    • Docker images & volumes no container uses (oldest first)")
         print()
         print(f"  {Colors.BOLD}Never touched:{Colors.RESET} source code, emulator images,")
         print(f"  Android SDK, ~/.m2, Xcode user schemes/breakpoints, .vercel/.netlify")
-        print(f"  project links, or anything that cannot be regenerated by a rebuild.")
+        print(f"  project links, Docker containers or images/volumes they use,")
+        print(f"  or anything that cannot be regenerated by a rebuild.")
         print()
         print(f"  {Colors.DIM}Pure Python — no external dependencies{Colors.RESET}")
         print()

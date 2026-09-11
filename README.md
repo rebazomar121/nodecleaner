@@ -10,6 +10,7 @@ A Python CLI tool that cleans junk files from Node.js, React Native, and Expo de
 - **System cache cleaning** — Xcode, npm, Yarn, pnpm, Bun, Gradle, CocoaPods, Metro, and more
 - **Project scanning** — Finds `node_modules`, build outputs, and framework caches across your projects
 - **App build finder** — Locates stray `.apk`, `.ipa`, and `.aab` files in Downloads, Documents, and Desktop so you can delete them in one go
+- **Docker cleanup** — Lists Docker images and volumes that no container uses, oldest first, so you can pick which ones to remove
 - **Interactive selector** — Arrow keys to navigate, space to toggle, 'a' to select all
 - **Safe deletion** — Type "yes" to confirm, with full summary of what will be removed
 - **Junk only** — Every target is something a rebuild, reinstall, or the tool itself regenerates. See [What It Never Touches](#what-it-never-touches)
@@ -70,8 +71,9 @@ nodecleaner --help
 | **[2] System Caches** | Scan only system-wide caches (Xcode, npm, Gradle, etc.) |
 | **[3] Project Files** | Scan a directory for node_modules, build outputs, etc. |
 | **[4] App Builds** | Find `.apk` / `.ipa` / `.aab` files in Downloads, Documents, Desktop (plus an optional extra folder) |
-| **[5] About** | Show information about the tool |
-| **[6] Exit** | Quit |
+| **[5] Docker Images & Volumes** | List images and volumes no container references, sorted oldest first, and remove the ones you pick |
+| **[6] About** | Show information about the tool |
+| **[7] Exit** | Quit |
 
 ### Interactive Selector Controls
 
@@ -125,6 +127,22 @@ nodecleaner --help
 Searched in `~/Downloads`, `~/Documents`, and `~/Desktop` by default. You can add one
 extra folder when prompted. Hidden folders, `node_modules`, and symlinks are skipped.
 
+### Docker Images & Volumes
+
+Needs Docker Desktop (or any Docker daemon) running; the menu says so and returns if it isn't.
+
+- **Images** — removed with `docker image rm`. Images with several tags are untagged all at once so the layers are actually freed.
+- **Volumes** — removed with `docker volume rm`. Sizes come from `docker system df -v` (shown as 0 B if your Docker CLI can't report them).
+
+Only images and volumes that **no container references** (running *or* stopped) are listed —
+Docker refuses to delete the others without removing the container first, which is the same
+rule Docker Desktop applies. The count of skipped in-use items is printed above the list.
+
+Docker does not record when an image or volume was last *used*, so the list is sorted by the
+closest thing it does keep: when an image was pulled / built / tagged and when a volume was
+created. Oldest items are at the top. Image sizes include shared layers, so the "freed" total
+is an upper bound when selected images share a base.
+
 ## What It Never Touches
 
 NodeCleaner only lists things that are recreated by a rebuild, a reinstall, or the tool
@@ -140,6 +158,7 @@ that owns them. It deliberately **does not** offer:
 - Committed JS bundles such as `ios/main.jsbundle`
 - Xcode `.xip` or Android Studio `.dmg` installers in Downloads
 - Symlinks — a symlinked target is skipped rather than followed or removed
+- Docker containers, and any image or volume a container (running or stopped) still references
 
 You always pick items from a list and confirm with "yes" before anything is deleted.
 Use `--dry-run` to preview.
