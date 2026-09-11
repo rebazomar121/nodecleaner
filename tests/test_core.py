@@ -173,3 +173,35 @@ def test_docker_available_without_cli(monkeypatch):
     ok, message = core.docker_available()
     assert ok is False
     assert "not found" in message
+
+
+# ── Interactive selector sorting ─────────────────────────────────────────────
+
+def _target(path, size, timestamp=0.0):
+    return core.CleanupTarget(path=path, description=path, category=core.Category.DIST,
+                              size=size, timestamp=timestamp)
+
+
+def test_selector_cycles_size_sort_and_keeps_cursor():
+    targets = [_target("big", 300), _target("mid", 200), _target("small", 100)]
+    sel = core.InteractiveSelector(targets)
+    assert sel._sort_modes[0][0] == "largest first"
+
+    sel.cursor = 2  # on "small"
+    sel._cycle_sort()
+    assert [t.path for t in sel.targets] == ["small", "mid", "big"]
+    assert sel.targets[sel.cursor].path == "small"
+
+    sel._cycle_sort()  # wraps back to largest first
+    assert [t.path for t in sel.targets] == ["big", "mid", "small"]
+
+
+def test_selector_docker_list_toggles_between_age_and_size():
+    targets = [_target("old-small", 10, timestamp=100), _target("new-big", 500, timestamp=900)]
+    sel = core.InteractiveSelector(targets)
+    assert sel._sort_modes[0][0] == "oldest first"
+
+    sel._cycle_sort()
+    assert [t.path for t in sel.targets] == ["new-big", "old-small"]
+    sel._cycle_sort()
+    assert [t.path for t in sel.targets] == ["old-small", "new-big"]

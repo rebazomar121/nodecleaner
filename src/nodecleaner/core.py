@@ -802,6 +802,26 @@ class InteractiveSelector:
         self.cursor = 0
         self.scroll_offset = 0
         self._old_settings = None
+        # Sort orders the 's' key cycles through. Lists with timestamps (Docker)
+        # start oldest-first; everything else starts largest-first.
+        if any(t.timestamp > 0 for t in targets):
+            self._sort_modes = [
+                ("oldest first", lambda t: (t.timestamp <= 0, t.timestamp, -t.size)),
+                ("largest first", lambda t: -t.size),
+            ]
+        else:
+            self._sort_modes = [
+                ("largest first", lambda t: -t.size),
+                ("smallest first", lambda t: t.size),
+            ]
+        self._sort_index = 0
+
+    def _cycle_sort(self):
+        """Switch to the next sort order, keeping the cursor on the same item."""
+        current = self.targets[self.cursor]
+        self._sort_index = (self._sort_index + 1) % len(self._sort_modes)
+        self.targets.sort(key=self._sort_modes[self._sort_index][1])
+        self.cursor = self.targets.index(current)
 
     def _get_terminal_height(self) -> int:
         try:
@@ -855,9 +875,11 @@ class InteractiveSelector:
         sys.stdout.write(f"\033[{lines_to_clear}A\033[J")
 
         # Header
+        sort_label = self._sort_modes[self._sort_index][0]
         print(f"  {Colors.BOLD}Select items to clean:{Colors.RESET}  "
-              f"({selected_count} selected, {Colors.YELLOW}{format_size(total_size)}{Colors.RESET})")
-        print(f"  {Colors.DIM}↑/↓ navigate  SPACE toggle  'a' all  ENTER confirm  'q' cancel{Colors.RESET}")
+              f"({selected_count} selected, {Colors.YELLOW}{format_size(total_size)}{Colors.RESET})"
+              f"  {Colors.DIM}sort: {sort_label}{Colors.RESET}")
+        print(f"  {Colors.DIM}↑/↓ navigate  SPACE toggle  'a' all  's' sort  ENTER confirm  'q' cancel{Colors.RESET}")
         print()
 
         # Items
@@ -929,6 +951,8 @@ class InteractiveSelector:
                     all_selected = all(t.selected for t in self.targets)
                     for t in self.targets:
                         t.selected = not all_selected
+                elif key == "s":
+                    self._cycle_sort()
                 elif key == "enter":
                     selected = [t for t in self.targets if t.selected]
                     return selected if selected else None

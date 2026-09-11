@@ -82,6 +82,7 @@ nodecleaner --help
 | `↑` / `↓` | Navigate items |
 | `Space` | Toggle selection |
 | `a` | Select / deselect all |
+| `s` | Cycle sort order (largest / smallest; for Docker: oldest / largest) |
 | `Enter` | Confirm selection |
 | `q` | Cancel and return to menu |
 
