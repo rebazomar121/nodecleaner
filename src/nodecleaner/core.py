@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 # 1. Constants & Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Runtime flags, set from CLI args in main().
 DRY_RUN = False
@@ -80,6 +80,12 @@ class Category(enum.Enum):
     LOGS = "Logs"
     DOCKER_IMAGE = "Docker Image"
     DOCKER_VOLUME = "Docker Volume"
+    APP_CACHE = "App Cache"
+    TRASH = "Trash"
+    APP_STATE = "Saved State"
+    INSTALLER = "Installer"
+    PARTIAL_DOWNLOAD = "Partial Download"
+    FIRMWARE = "iOS Firmware"
 
 
 @dataclass
@@ -95,6 +101,9 @@ class CleanupTarget:
     # Epoch seconds of when the item was created / last tagged. Only set for
     # Docker targets, which are sorted oldest-first instead of largest-first.
     timestamp: float = 0.0
+    # When True, only the directory's contents are deleted and the directory
+    # itself is kept (e.g. ~/.Trash, which macOS expects to exist).
+    contents_only: bool = False
 
 
 HOME = os.path.expanduser("~")
@@ -259,6 +268,49 @@ APP_BUILD_SCAN_DIRS = [
     os.path.join(HOME, "Downloads"),
     os.path.join(HOME, "Documents"),
     os.path.join(HOME, "Desktop"),
+]
+
+# ── General macOS junk (not tied to development tools) ──
+# Every entry directly under these folders is listed on its own, so you can
+# pick which apps' caches / logs to clear.
+MAC_JUNK_PER_APP_DIRS = [
+    (os.path.join("Library", "Caches"), "cache", Category.APP_CACHE),
+    (os.path.join("Library", "Logs"), "logs", Category.LOGS),
+]
+# ~/Library/Caches entries holding live iCloud sync / in-flight download state.
+MAC_CACHE_SKIP = {"com.apple.bird", "com.apple.nsurlsessiond", "CloudKit"}
+
+# Chromium / Electron cache folders (Chrome, Edge, Brave, Slack, Discord, Teams, ...)
+# found 1-3 levels below ~/Library/Application Support.
+APP_SUPPORT_CACHE_SUBDIRS = (
+    "Cache", "Code Cache", "GPUCache", "DawnCache", "DawnGraphiteCache",
+    "DawnWebGPUCache", "GrShaderCache", "ShaderCache",
+    os.path.join("Service Worker", "CacheStorage"),
+)
+
+# Folders whose contents are deleted while the folder itself is kept.
+MAC_JUNK_EMPTY_DIRS = [
+    (".Trash", "Trash", Category.TRASH),
+    (os.path.join("Library", "Saved Application State"), "Saved app window state", Category.APP_STATE),
+]
+
+# Glob patterns relative to HOME for single junk files.
+MAC_JUNK_FILE_GLOBS = [
+    (os.path.join("Library", "iTunes", "*Software Updates", "*.ipsw"), "Old iOS / iPadOS firmware", Category.FIRMWARE),
+]
+
+# Installers and unfinished downloads (lower-case fnmatch on the name) left in these folders.
+MAC_JUNK_DOWNLOAD_DIRS = ["Downloads", "Desktop"]
+MAC_JUNK_DOWNLOAD_PATTERNS = [
+    ("*.dmg", "Disk image installer", Category.INSTALLER),
+    ("*.pkg", "Installer package", Category.INSTALLER),
+    ("*.mpkg", "Installer package", Category.INSTALLER),
+    ("*.xip", "Xcode installer archive", Category.INSTALLER),
+    ("*.crdownload", "Unfinished Chrome download", Category.PARTIAL_DOWNLOAD),
+    ("*.download", "Unfinished Safari download", Category.PARTIAL_DOWNLOAD),
+    ("*.part", "Unfinished Firefox download", Category.PARTIAL_DOWNLOAD),
+    ("*.partial", "Unfinished Edge download", Category.PARTIAL_DOWNLOAD),
+    ("*.opdownload", "Unfinished Opera download", Category.PARTIAL_DOWNLOAD),
 ]
 
 # Seconds to wait for a single `docker` CLI call. The CLI can hang for minutes
@@ -581,6 +633,123 @@ def scan_app_builds(base_dirs: Optional[List[str]] = None) -> List[CleanupTarget
     return targets
 
 
+# ── General macOS junk ──────────────────────────────────────────────────────
+
+def _add_file_target(targets, seen, path, desc, cat) -> None:
+    """Append a file target if it exists, is not a symlink, is non-empty and unseen."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    real = os.path.realpath(path)
+    if real in seen or size == 0:
+        return
+    seen.add(real)
+    targets.append(CleanupTarget(path=path, description=desc, category=cat, size=size))
+
+
+def _match_download_junk(name: str) -> Optional[Tuple[str, Category]]:
+    """Return (description, category) if `name` looks like an installer / partial download."""
+    lower = name.lower()
+    for pattern, desc, cat in MAC_JUNK_DOWNLOAD_PATTERNS:
+        if fnmatch.fnmatchcase(lower, pattern):
+            return desc, cat
+    return None
+
+
+def trash_readable(home: Optional[str] = None) -> bool:
+    """False when macOS blocks reading ~/.Trash (terminal lacks Full Disk Access)."""
+    try:
+        os.listdir(os.path.join(home or HOME, ".Trash"))
+    except PermissionError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
+def scan_mac_junk(home: Optional[str] = None) -> List[CleanupTarget]:
+    """Find general macOS junk that is not tied to development tools.
+
+    Per-app caches and logs, Chromium / Electron app caches, the Trash, saved
+    window state, old iOS firmware, and installers / unfinished downloads in
+    Downloads and Desktop. Symlinks are never followed.
+    """
+    home = home or HOME
+    targets: List[CleanupTarget] = []
+    seen = set()
+
+    # One target per app under ~/Library/Caches and ~/Library/Logs.
+    for rel, kind, cat in MAC_JUNK_PER_APP_DIRS:
+        try:
+            with os.scandir(os.path.join(home, rel)) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name in MAC_CACHE_SKIP or entry.name.startswith("."):
+                continue
+            label = f"{entry.name} {kind}"
+            if entry.is_dir(follow_symlinks=False):
+                _add_dir_target(targets, seen, entry.path, label, cat)
+            else:
+                _add_file_target(targets, seen, entry.path, label, cat)
+
+    # Browser / Electron caches inside Application Support.
+    app_support = os.path.join(home, "Library", "Application Support")
+    for sub in APP_SUPPORT_CACHE_SUBDIRS:
+        for depth in (1, 2, 3):
+            pattern = os.path.join(app_support, *(["*"] * depth), sub)
+            for match in sorted(glob.glob(pattern)):
+                app = os.path.relpath(match, app_support)[: -len(sub) - 1]
+                _add_dir_target(targets, seen, match, f"{app} cache ({sub})", Category.APP_CACHE)
+
+    # Trash & saved window state: empty them, keep the folder.
+    for rel, desc, cat in MAC_JUNK_EMPTY_DIRS:
+        path = os.path.join(home, rel)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        size = _get_dir_size(path)
+        if size > 0:
+            targets.append(CleanupTarget(
+                path=path, description=desc, category=cat, size=size, contents_only=True,
+            ))
+
+    for pattern, desc, cat in MAC_JUNK_FILE_GLOBS:
+        for match in sorted(glob.glob(os.path.join(home, pattern))):
+            _add_file_target(targets, seen, match, desc, cat)
+
+    # Installers and unfinished downloads (Safari's .download is a folder).
+    for rel in MAC_JUNK_DOWNLOAD_DIRS:
+        base = os.path.join(home, rel)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            kept = []
+            for d in dirnames:
+                if d in PRUNE_DIRS or d.startswith("."):
+                    continue
+                match = _match_download_junk(d)
+                if match:
+                    _add_dir_target(targets, seen, os.path.join(dirpath, d), *match)
+                else:
+                    kept.append(d)
+            dirnames[:] = kept
+            for name in filenames:
+                match = _match_download_junk(name)
+                if match:
+                    _add_file_target(targets, seen, os.path.join(dirpath, name), *match)
+
+    targets.sort(key=lambda t: t.size, reverse=True)
+    return targets
+
+
 # ── Docker ──────────────────────────────────────────────────────────────────
 
 def _docker_run(args: List[str], timeout: int = DOCKER_TIMEOUT) -> Optional[str]:
@@ -794,6 +963,14 @@ def scan_docker() -> Tuple[List[CleanupTarget], int]:
 # 4. Interactive Selector
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _display_label(t: CleanupTarget) -> str:
+    """How a target is shown: command targets by description, others by ~-path."""
+    if t.command:
+        return t.description
+    label = t.path.replace(HOME, "~")
+    return f"{label} (contents)" if t.contents_only else label
+
+
 class InteractiveSelector:
     """Raw terminal checkbox selector using tty/termios."""
 
@@ -893,7 +1070,7 @@ class InteractiveSelector:
             cat_str = f"{Colors.DIM}[{t.category.value}]{Colors.RESET}"
 
             # Shorten path for display (command targets show their description instead)
-            display_path = t.description if t.command else t.path.replace(HOME, "~")
+            display_path = _display_label(t)
             if len(display_path) > 50:
                 display_path = "..." + display_path[-47:]
 
@@ -975,6 +1152,20 @@ def _rmtree_onerror(func, path, exc_info):
     pass
 
 
+def _empty_dir(path: str) -> None:
+    """Delete everything inside `path` but keep the directory itself."""
+    with os.scandir(path) as it:
+        entries = list(it)
+    for entry in entries:
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path, onerror=_rmtree_onerror)
+            else:
+                os.remove(entry.path)
+        except OSError:
+            pass
+
+
 def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
     """Delete selected targets. Returns (success_count, fail_count, freed_bytes)."""
     success = 0
@@ -984,7 +1175,7 @@ def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
 
     print()
     for i, target in enumerate(targets):
-        label = target.description if target.command else target.path.replace(HOME, "~")
+        label = _display_label(target)
         if len(label) > 40:
             label = "..." + label[-37:]
         sys.stdout.write(progress_bar(i, total, label=label))
@@ -1004,6 +1195,16 @@ def delete_targets(targets: List[CleanupTarget]) -> Tuple[int, int, int]:
                 if result.returncode == 0:
                     success += 1
                     freed += target.size
+                else:
+                    failed += 1
+                continue
+            if target.contents_only:
+                # Folder that must stay (e.g. ~/.Trash) — empty it in place.
+                _empty_dir(target.path)
+                remaining = _get_dir_size(target.path)
+                freed += max(target.size - remaining, 0)
+                if remaining < target.size:
+                    success += 1
                 else:
                     failed += 1
                 continue
@@ -1091,8 +1292,10 @@ class NodeCleaner:
             elif choice == "5":
                 self._run_docker_clean()
             elif choice == "6":
-                self._show_about()
+                self._run_mac_junk_clean()
             elif choice == "7":
+                self._show_about()
+            elif choice == "8":
                 self._exit()
             else:
                 print(f"  {Colors.RED}Invalid choice. Please try again.{Colors.RESET}")
@@ -1112,14 +1315,15 @@ class NodeCleaner:
         print(f"  {Colors.CYAN}[3]{Colors.RESET} Project Files Only")
         print(f"  {Colors.CYAN}[4]{Colors.RESET} App Builds (.apk / .ipa / .aab)")
         print(f"  {Colors.CYAN}[5]{Colors.RESET} Docker Images & Volumes")
-        print(f"  {Colors.CYAN}[6]{Colors.RESET} About")
-        print(f"  {Colors.CYAN}[7]{Colors.RESET} Exit")
+        print(f"  {Colors.CYAN}[6]{Colors.RESET} Mac Junk (app caches, logs, Trash, installers)")
+        print(f"  {Colors.CYAN}[7]{Colors.RESET} About")
+        print(f"  {Colors.CYAN}[8]{Colors.RESET} Exit")
         print()
 
         try:
-            choice = input(f"  {Colors.BOLD}Choose an option [1-7]:{Colors.RESET} ").strip()
+            choice = input(f"  {Colors.BOLD}Choose an option [1-8]:{Colors.RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
-            choice = "7"
+            choice = "8"
         print()
         return choice
 
@@ -1185,8 +1389,7 @@ class NodeCleaner:
 
         # Show what will be deleted
         for t in selected[:10]:
-            display_path = t.description if t.command else t.path.replace(HOME, "~")
-            print(f"    {Colors.RED}•{Colors.RESET} {display_path}")
+            print(f"    {Colors.RED}•{Colors.RESET} {_display_label(t)}")
         if len(selected) > 10:
             print(f"    {Colors.DIM}... and {len(selected) - 10} more{Colors.RESET}")
 
@@ -1305,6 +1508,25 @@ class NodeCleaner:
         if selected:
             self._confirm_and_delete(selected)
 
+    def _run_mac_junk_clean(self):
+        """Find general Mac junk: app caches & logs, Trash, installers, unfinished downloads."""
+        print(f"  {Colors.BOLD}Scanning for general Mac junk...{Colors.RESET}")
+        spinner = Spinner("Scanning caches, logs, Trash, Downloads and Desktop")
+        spinner.start()
+        targets = scan_mac_junk()
+        spinner.stop(f"Found {len(targets)} junk items")
+
+        if not trash_readable():
+            print(f"  {Colors.DIM}Trash skipped: give your terminal Full Disk Access "
+                  f"(System Settings → Privacy & Security) to include it.{Colors.RESET}")
+        print(f"  {Colors.DIM}Tip: quit an app before clearing its cache — it is rebuilt "
+              f"on next launch.{Colors.RESET}")
+        print()
+
+        selected = self._scan_and_select(targets)
+        if selected:
+            self._confirm_and_delete(selected)
+
     def _run_full_clean(self):
         """Run both system and project cleanup."""
         projects_dir = self._prompt_projects_dir()
@@ -1368,6 +1590,8 @@ class NodeCleaner:
         print(f"    • Stray logs, .eslintcache, *.tsbuildinfo, *.hprof")
         print(f"    • .apk / .ipa / .aab app builds in Downloads, Documents, Desktop")
         print(f"    • Docker images & volumes no container uses (oldest first)")
+        print(f"    • Mac junk: app caches & logs, browser caches, Trash,")
+        print(f"      .dmg/.pkg installers, unfinished downloads, old .ipsw")
         print()
         print(f"  {Colors.BOLD}Never touched:{Colors.RESET} source code, emulator images,")
         print(f"  Android SDK, ~/.m2, Xcode user schemes/breakpoints, .vercel/.netlify")

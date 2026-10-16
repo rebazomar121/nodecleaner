@@ -11,6 +11,7 @@ A Python CLI tool that cleans junk files from Node.js, React Native, and Expo de
 - **Project scanning** — Finds `node_modules`, build outputs, and framework caches across your projects
 - **App build finder** — Locates stray `.apk`, `.ipa`, and `.aab` files in Downloads, Documents, and Desktop so you can delete them in one go
 - **Docker cleanup** — Lists Docker images and volumes that no container uses, oldest first, so you can pick which ones to remove
+- **Mac junk finder** — Beyond dev tools: per-app caches and logs, browser / Electron app caches, the Trash, leftover `.dmg` / `.pkg` installers, unfinished downloads, and old iOS firmware
 - **Interactive selector** — Arrow keys to navigate, space to toggle, 'a' to select all
 - **Safe deletion** — Type "yes" to confirm, with full summary of what will be removed
 - **Junk only** — Every target is something a rebuild, reinstall, or the tool itself regenerates. See [What It Never Touches](#what-it-never-touches)
@@ -72,8 +73,9 @@ nodecleaner --help
 | **[3] Project Files** | Scan a directory for node_modules, build outputs, etc. |
 | **[4] App Builds** | Find `.apk` / `.ipa` / `.aab` files in Downloads, Documents, Desktop (plus an optional extra folder) |
 | **[5] Docker Images & Volumes** | List images and volumes no container references, sorted oldest first, and remove the ones you pick |
-| **[6] About** | Show information about the tool |
-| **[7] Exit** | Quit |
+| **[6] Mac Junk** | General macOS junk not tied to development: app caches & logs, browser caches, Trash, installers, unfinished downloads |
+| **[7] About** | Show information about the tool |
+| **[8] Exit** | Quit |
 
 ### Interactive Selector Controls
 
@@ -144,6 +146,20 @@ closest thing it does keep: when an image was pulled / built / tagged and when a
 created. Oldest items are at the top. Image sizes include shared layers, so the "freed" total
 is an upper bound when selected images share a base.
 
+### Mac Junk
+
+General clutter that has nothing to do with development:
+
+- `~/Library/Caches/*` — every app's cache, listed per app (iCloud sync state such as `com.apple.bird` is skipped)
+- `~/Library/Logs/*` — app logs and crash reports (`DiagnosticReports`)
+- Browser and Electron app caches in `~/Library/Application Support` — `Cache`, `Code Cache`, `GPUCache`, `Service Worker/CacheStorage`, etc. for Chrome, Edge, Brave, Slack, Discord, Teams, Postman…
+- **Trash** (`~/.Trash`) — emptied in place. Needs Full Disk Access for your terminal; the menu tells you if it was skipped
+- Saved app window state (`~/Library/Saved Application State`) — emptied in place
+- Old iOS / iPadOS firmware (`~/Library/iTunes/*Software Updates/*.ipsw`)
+- In `~/Downloads` and `~/Desktop`: installers (`.dmg`, `.pkg`, `.mpkg`, `.xip`) and unfinished downloads (`.crdownload`, `.download`, `.part`, `.partial`, `.opdownload`)
+
+Quit an app before clearing its cache; it is rebuilt on next launch.
+
 ## What It Never Touches
 
 NodeCleaner only lists things that are recreated by a rebuild, a reinstall, or the tool
@@ -157,7 +173,8 @@ that owns them. It deliberately **does not** offer:
 - Yarn zero-install caches (`.yarn/cache`) that may be committed
 - `.vercel`, `.netlify`, `.wrangler` — these hold project links and local dev state
 - Committed JS bundles such as `ios/main.jsbundle`
-- Xcode `.xip` or Android Studio `.dmg` installers in Downloads
+- Xcode `.xip` or Android Studio `.dmg` installers in Downloads (only the separate **Mac Junk** option lists installers)
+- iPhone / iPad backups (`MobileSync/Backup`), Photos, Mail, and sandboxed app containers
 - Symlinks — a symlinked target is skipped rather than followed or removed
 - Docker containers, and any image or volume a container (running or stopped) still references
 

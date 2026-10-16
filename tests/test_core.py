@@ -205,3 +205,69 @@ def test_selector_docker_list_toggles_between_age_and_size():
     assert [t.path for t in sel.targets] == ["new-big", "old-small"]
     sel._cycle_sort()
     assert [t.path for t in sel.targets] == ["old-small", "new-big"]
+
+
+# ── General Mac junk ─────────────────────────────────────────────────────────
+
+def _write(path, size):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * size)
+
+
+def test_scan_mac_junk_finds_general_junk(tmp_path):
+    home = tmp_path
+    _write(home / "Library/Caches/com.spotify.client/data", 500)
+    _write(home / "Library/Caches/com.apple.bird/keep", 500)  # iCloud sync state
+    _write(home / "Library/Logs/DiagnosticReports/crash.ips", 40)
+    _write(home / "Library/Application Support/Slack/Code Cache/js/a", 300)
+    _write(home / "Library/Application Support/Google/Chrome/Default/Service Worker/CacheStorage/x", 70)
+    _write(home / ".Trash/old.mov", 900)
+    _write(home / "Library/iTunes/iPhone Software Updates/iPhone_17.ipsw", 800)
+    _write(home / "Downloads/Some App.DMG", 600)
+    _write(home / "Downloads/sub/video.mp4.crdownload", 30)
+    _write(home / "Downloads/movie.mp4.download/data", 20)  # Safari partial is a folder
+    _write(home / "Downloads/notes.txt", 10)  # regular file, not junk
+    _write(home / "Desktop/Installer.pkg", 50)
+
+    targets = core.scan_mac_junk(str(home))
+    by_rel = {os.path.relpath(t.path, home): t for t in targets}
+
+    assert set(by_rel) == {
+        "Library/Caches/com.spotify.client",
+        "Library/Logs/DiagnosticReports",
+        "Library/Application Support/Slack/Code Cache",
+        "Library/Application Support/Google/Chrome/Default/Service Worker/CacheStorage",
+        ".Trash",
+        "Library/iTunes/iPhone Software Updates/iPhone_17.ipsw",
+        "Downloads/Some App.DMG",
+        "Downloads/sub/video.mp4.crdownload",
+        "Downloads/movie.mp4.download",
+        "Desktop/Installer.pkg",
+    }
+    assert by_rel[".Trash"].contents_only is True
+    assert by_rel[".Trash"].category is core.Category.TRASH
+    assert by_rel["Downloads/Some App.DMG"].category is core.Category.INSTALLER
+    assert by_rel["Library/Application Support/Slack/Code Cache"].description == "Slack cache (Code Cache)"
+    assert [t.size for t in targets] == sorted((t.size for t in targets), reverse=True)
+
+
+def test_scan_mac_junk_empty_home_returns_nothing(tmp_path):
+    assert core.scan_mac_junk(str(tmp_path)) == []
+
+
+def test_delete_contents_only_keeps_folder(tmp_path):
+    trash = tmp_path / ".Trash"
+    _write(trash / "a.bin", 100)
+    _write(trash / "folder/b.bin", 50)
+    target = core.CleanupTarget(path=str(trash), description="Trash", category=core.Category.TRASH,
+                                size=150, contents_only=True)
+
+    success, failed, freed = core.delete_targets([target])
+
+    assert (success, failed, freed) == (1, 0, 150)
+    assert trash.is_dir()
+    assert list(trash.iterdir()) == []
+
+
+def test_trash_readable_when_missing(tmp_path):
+    assert core.trash_readable(str(tmp_path)) is True
